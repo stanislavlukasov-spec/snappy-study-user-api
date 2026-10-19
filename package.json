@@ -1,0 +1,38 @@
+{
+  "name": "snappy-study-user-api",
+  "version": "1.0.0",
+  "description": "User + kid auth service (parents, kids, QR pairing, child sessions)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "npm test && bash ./deploy.sh",
+    "migrate": "bash ./migrate.sh",
+    "ship": "npm install && npm run deploy",
+    "update-google-keys": "node scripts/fetch-google-keys.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ses": "^3.600.0",
+    "bcryptjs": "^2.4.3",
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "google-auth-library": "^9.15.1",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.10.0",
+    "serverless-http": "^3.2.0",
+    "uuid": "^10.0.0",
+    "jwk-to-pem": "^2.0.6",
+    "zod": "^4.3.6"
+  }
+}

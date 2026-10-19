@@ -1,0 +1,1549 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Snappy Study User API (auth, parents, kids, QR pairing, child sessions)
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+  ArtifactKey:
+    Type: String
+
+  # ── Database ──────────────────────────────────────────────────────────────────
+  DbHost:
+    Type: String
+  DbUser:
+    Type: String
+  DbPassword:
+    Type: String
+    NoEcho: true
+  DbName:
+    Type: String
+    Default: 'snappy_study_user'
+
+  # ── Auth secrets ──────────────────────────────────────────────────────────────
+  JwtSecret:
+    Type: String
+    NoEcho: true
+  GoogleClientId:
+    Type: String
+
+  # ── Apple Sign In ────────────────────────────────────────────────────────────
+  # The iOS bundle id is the audience claim Apple stamps into identity tokens.
+  AppleBundleId:
+    Type: String
+    Default: com.snappystudy.app
+
+  # ── Email ─────────────────────────────────────────────────────────────────────
+  SenderEmail:
+    Type: String
+    Default: 'noreply@snappystudy.com'
+    Description: Verified SES sender address (domain must be verified in SES)
+
+  # ── RevenueCat (in-app purchases) ─────────────────────────────────────────────
+  RevenueCatWebhookAuth:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Shared secret expected in the Authorization header of RevenueCat webhooks
+
+  SentryDsn:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Sentry DSN for error tracking (leave empty to disable)
+
+  UserApiKey:
+    Type: String
+    NoEcho: true
+    Description: Secret key required in x-api-key header for all app requests
+
+  # ── Existing VPC where the RDS instance lives ─────────────────────────────────
+  # Find these in the AWS Console:
+  #   VPC ID      → VPC → Your VPCs
+  #   Subnet IDs  → VPC → Subnets (pick the private subnets in the RDS VPC)
+  #   RDS SG ID   → EC2 → Security Groups (the SG attached to your RDS instance)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the RDS instance lives
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs inside the RDS VPC (comma-separated, e.g. subnet-aaa,subnet-bbb)
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group currently attached to the RDS instance
+
+  # ── Networking ────────────────────────────────────────────────────────────────
+  PrivateRouteTableId:
+    Type: String
+    Description: Route table ID for the private subnets (will receive the NAT Gateway default route)
+
+Resources:
+
+  # ── Security group for the Lambda functions ───────────────────────────────────
+  # Created in the EXISTING VPC so the Lambdas can reach the RDS.
+  UserLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Snappy Study user-api Lambda - outbound to RDS
+      VpcId: !Ref VpcId
+
+  # ── Internet Gateway ─────────────────────────────────────────────────────────
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcId
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public subnet (NAT Gateway lives here) ───────────────────────────────────
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: eu-central-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-eu-central-1a"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── NAT Gateway ───────────────────────────────────────────────────────────────
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  # Route all outbound traffic from the private subnets through the NAT Gateway
+  PrivateInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableId
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Allow MySQL traffic from the Lambda SG into the RDS SG.
+  # This modifies the pre-existing RDS security group (no replacement needed).
+  RdsIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref UserLambdaSecurityGroup
+      Description: Allow MySQL from snappy-study-user-api Lambda
+
+  # ── IAM role shared by all Lambdas ───────────────────────────────────────────
+  UserApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SESsendEmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  # ── Migration Lambda (no API Gateway route – invoked via AWS CLI) ─────────────
+  # Usage:  bash migrate.sh
+  MigrateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-migrate"
+      Runtime: nodejs22.x
+      Handler: src/handlers/migrate.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 120
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/register ────────────────────────────────────────────────
+  AuthRegisterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/authRegister.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENDER_EMAIL: !Ref SenderEmail
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/login ───────────────────────────────────────────────────
+  AuthLoginLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/authLogin.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/google ──────────────────────────────────────────────────
+  AuthGoogleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/authGoogle.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENDER_EMAIL: !Ref SenderEmail
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/apple ───────────────────────────────────────────────────
+  AuthAppleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/authApple.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+          SENDER_EMAIL: !Ref SenderEmail
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: GET /me ──────────────────────────────────────────────────────────
+  ParentMeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/parentMe.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: DELETE /me (account deletion, App Store 5.1.1(v)) ────────────────
+  ParentDeleteLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/parentDelete.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: POST /children ───────────────────────────────────────────────────
+  CreateChildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/createChild.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: PATCH /children/{childId} ───────────────────────────────────────
+  UpdateChildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/updateChild.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: DELETE /children/{childId} ──────────────────────────────────────
+  DeleteChildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/deleteChild.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: POST /children/{childId}/qr ─────────────────────────────────────
+  GenerateChildQrLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/generateChildQr.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Child: POST /child-session/qr ───────────────────────────────────────────
+  ChildSessionFromQrLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/childSessionFromQr.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: PATCH /me ────────────────────────────────────────────────────────
+  UpdateMeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/updateMe.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/change-password ─────────────────────────────────────────
+  ChangePasswordLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/changePassword.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: GET /auth/verify-email ─────────────────────────────────────────────
+  VerifyEmailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/verifyEmail.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          SENDER_EMAIL: !Ref SenderEmail
+          USER_API_BASE_URL: !Sub https://${UserHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/resend-verification ─────────────────────────────────────
+  ResendVerificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/resendVerification.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          SENDER_EMAIL: !Ref SenderEmail
+          USER_API_BASE_URL: !Sub https://${UserHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Subscription: POST /subscription/trial ───────────────────────────────────
+  SubscriptionTrialLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/subscriptionTrial.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          SENDER_EMAIL: !Ref SenderEmail
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: GET /auth/verification-poll ────────────────────────────────────────
+  VerificationPollLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/verificationPoll.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 10
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: POST /auth/forgot-password ─────────────────────────────────────────
+  ForgotPasswordLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/forgotPassword.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          SENDER_EMAIL: !Ref SenderEmail
+          USER_API_BASE_URL: !Sub https://${UserHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Auth: GET + POST /auth/reset-password ────────────────────────────────────
+  ResetPasswordLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/resetPassword.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── RevenueCat Webhook: POST /webhooks/revenuecat ────────────────────────────
+  # Note: This is public (no JWT auth) – RevenueCat authenticates via the
+  # Authorization header value (REVENUECAT_WEBHOOK_AUTH).
+  RevenueCatWebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/revenuecatWebhook.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          REVENUECAT_WEBHOOK_AUTH: !Ref RevenueCatWebhookAuth
+          SENDER_EMAIL: !Ref SenderEmail
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: GET /activity (all children combined) ────────────────────────────
+  ParentActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/parentActivity.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Child: POST /child/activity ──────────────────────────────────────────────
+  ChildLogActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/childLogActivity.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Parent: GET /children/{childId}/activity ──────────────────────────────────
+  ParentChildActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/parentChildActivity.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── Child: GET /child/me ─────────────────────────────────────────────────────
+  ChildMeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: src/handlers/childMe.handler
+      Role: !GetAtt UserApiLambdaRole.Arn
+      Layers:
+        - arn:aws:lambda:eu-central-1:943013980633:layer:SentryNodeServerlessSDKv10:63
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      MemorySize: 512
+      Timeout: 30
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref UserLambdaSecurityGroup
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          DB_NAME: !Ref DbName
+          JWT_SECRET: !Ref JwtSecret
+          GOOGLE_CLIENT_ID: !Ref GoogleClientId
+          SENTRY_DSN: !Ref SentryDsn
+          NODE_OPTIONS: '--import @sentry/aws-serverless/awslambda-auto'
+          USER_API_KEY: !Ref UserApiKey
+
+  # ── HTTP API ─────────────────────────────────────────────────────────────────
+  UserHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: SnappyStudyUserApi
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+
+  # ── Integrations ──────────────────────────────────────────────────────────────
+  AuthRegisterIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthRegisterLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  AuthLoginIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLoginLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  AuthGoogleIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthGoogleLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  AuthAppleIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthAppleLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ParentMeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ParentMeLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ParentDeleteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ParentDeleteLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  CreateChildIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateChildLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  UpdateChildIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateChildLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  DeleteChildIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteChildLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  GenerateChildQrIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateChildQrLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ChildSessionFromQrIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChildSessionFromQrLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  UpdateMeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateMeLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ChangePasswordIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChangePasswordLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ParentActivityIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ParentActivityLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ChildLogActivityIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChildLogActivityLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ParentChildActivityIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ParentChildActivityLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ChildMeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChildMeLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  VerifyEmailIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VerifyEmailLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ResendVerificationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResendVerificationLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  SubscriptionTrialIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubscriptionTrialLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  VerificationPollIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VerificationPollLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ForgotPasswordIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForgotPasswordLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  ResetPasswordIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResetPasswordLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  RevenueCatWebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UserHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RevenueCatWebhookLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  # ── Routes ────────────────────────────────────────────────────────────────────
+  AuthRegisterRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/register'
+      Target: !Sub integrations/${AuthRegisterIntegration}
+
+  AuthLoginRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/login'
+      Target: !Sub integrations/${AuthLoginIntegration}
+
+  AuthGoogleRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/google'
+      Target: !Sub integrations/${AuthGoogleIntegration}
+
+  AuthAppleRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/apple'
+      Target: !Sub integrations/${AuthAppleIntegration}
+
+  ParentMeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /me'
+      Target: !Sub integrations/${ParentMeIntegration}
+
+  ParentDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'DELETE /me'
+      Target: !Sub integrations/${ParentDeleteIntegration}
+
+  CreateChildRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /children'
+      Target: !Sub integrations/${CreateChildIntegration}
+
+  UpdateChildRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'PATCH /children/{childId}'
+      Target: !Sub integrations/${UpdateChildIntegration}
+
+  DeleteChildRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'DELETE /children/{childId}'
+      Target: !Sub integrations/${DeleteChildIntegration}
+
+  GenerateChildQrRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /children/{childId}/qr'
+      Target: !Sub integrations/${GenerateChildQrIntegration}
+
+  ChildSessionFromQrRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /child-session/qr'
+      Target: !Sub integrations/${ChildSessionFromQrIntegration}
+
+  UpdateMeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'PATCH /me'
+      Target: !Sub integrations/${UpdateMeIntegration}
+
+  ChangePasswordRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/change-password'
+      Target: !Sub integrations/${ChangePasswordIntegration}
+
+  ParentActivityRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /activity'
+      Target: !Sub integrations/${ParentActivityIntegration}
+
+  ChildLogActivityRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /child/activity'
+      Target: !Sub integrations/${ChildLogActivityIntegration}
+
+  ParentChildActivityRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /children/{childId}/activity'
+      Target: !Sub integrations/${ParentChildActivityIntegration}
+
+  ChildMeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /child/me'
+      Target: !Sub integrations/${ChildMeIntegration}
+
+  VerifyEmailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /auth/verify-email'
+      Target: !Sub integrations/${VerifyEmailIntegration}
+
+  ResendVerificationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/resend-verification'
+      Target: !Sub integrations/${ResendVerificationIntegration}
+
+  SubscriptionTrialRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /subscription/trial'
+      Target: !Sub integrations/${SubscriptionTrialIntegration}
+
+  VerificationPollRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /auth/verification-poll'
+      Target: !Sub integrations/${VerificationPollIntegration}
+
+  ForgotPasswordRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/forgot-password'
+      Target: !Sub integrations/${ForgotPasswordIntegration}
+
+  ResetPasswordGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'GET /auth/reset-password'
+      Target: !Sub integrations/${ResetPasswordIntegration}
+
+  ResetPasswordPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /auth/reset-password'
+      Target: !Sub integrations/${ResetPasswordIntegration}
+
+  RevenueCatWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UserHttpApi
+      RouteKey: 'POST /webhooks/revenuecat'
+      Target: !Sub integrations/${RevenueCatWebhookIntegration}
+
+  UserApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref UserHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 50
+        ThrottlingBurstLimit: 100
+
+  # ── Lambda invoke permissions ─────────────────────────────────────────────────
+  AuthRegisterLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthRegisterLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/register
+
+  AuthLoginLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthLoginLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/login
+
+  AuthGoogleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthGoogleLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/google
+
+  AuthAppleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthAppleLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/apple
+
+  ParentMeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ParentMeLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/me
+
+  ParentDeleteLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ParentDeleteLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/me
+
+  CreateChildLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateChildLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/children
+
+  UpdateChildLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateChildLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/children/*
+
+  DeleteChildLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeleteChildLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/children/*
+
+  GenerateChildQrLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GenerateChildQrLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/children/*/qr
+
+  ChildSessionFromQrLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChildSessionFromQrLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/child-session/qr
+
+  UpdateMeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateMeLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/me
+
+  ChangePasswordLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChangePasswordLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/change-password
+
+  ParentActivityLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ParentActivityLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/activity
+
+  ChildLogActivityLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChildLogActivityLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/child/activity
+
+  ParentChildActivityLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ParentChildActivityLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/children/*/activity
+
+  ChildMeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChildMeLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/child/me
+
+  VerifyEmailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref VerifyEmailLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/verify-email
+
+  ResendVerificationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ResendVerificationLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/resend-verification
+
+  SubscriptionTrialLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SubscriptionTrialLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/subscription/trial
+
+  VerificationPollLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref VerificationPollLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/verification-poll
+
+  ForgotPasswordLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ForgotPasswordLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/forgot-password
+
+  ResetPasswordLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ResetPasswordLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/auth/reset-password
+
+  RevenueCatWebhookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RevenueCatWebhookLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserHttpApi}/*/*/webhooks/revenuecat
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTPS endpoint for the Snappy Study user API
+    Value: !Sub https://${UserHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  LambdaSecurityGroupId:
+    Description: Security group ID created for the Lambda functions
+    Value: !Ref UserLambdaSecurityGroup
